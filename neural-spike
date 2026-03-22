@@ -1,77 +1,76 @@
 #!/usr/bin/env python3
-"""Spiking Neural Network Screensaver with STDP - renders fullscreen."""
-import tkinter as tk
+"""Spiking Neural Network Screensaver with STDP — pygame version."""
+import os
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
+
+import pygame
 import math
 import random
 import sys
-import os
 import time
 
 random.seed()
 
 # STDP parameters
-STDP_A_PLUS = 0.02      # LTP amplitude (pre before post)
-STDP_A_MINUS = 0.015    # LTD amplitude (post before pre)
-STDP_TAU_PLUS = 20.0    # LTP time window (frames)
-STDP_TAU_MINUS = 25.0   # LTD time window (frames)
-STDP_W_MIN = 0.05       # Minimum synaptic weight
-STDP_W_MAX = 1.2        # Maximum synaptic weight
+STDP_A_PLUS = 0.015
+STDP_A_MINUS = 0.012
+STDP_TAU_PLUS = 20.0
+STDP_TAU_MINUS = 25.0
+STDP_W_MIN = 0.05
+STDP_W_MAX = 1.2
+
+FPS = 30
 
 
 class Synapse:
-    """A synapse with mutable weight for STDP."""
+    __slots__ = ('source', 'target', 'weight', 'delay')
+
     def __init__(self, source, target, weight, delay):
         self.source = source
         self.target = target
         self.weight = weight
         self.delay = delay
-        self.canvas_id = None  # set after drawing
 
-    def apply_stdp(self, frame):
-        """Apply STDP rule based on pre/post spike timing."""
-        pre_time = self.source.spike_time
-        post_time = self.target.spike_time
-
-        if pre_time < 0 or post_time < 0:
+    def apply_stdp(self):
+        dt = self.target.spike_time - self.source.spike_time
+        if self.source.spike_time < 0 or self.target.spike_time < 0:
             return
-
-        dt = post_time - pre_time  # positive = pre before post (LTP)
-
         if dt > 0 and dt < STDP_TAU_PLUS * 3:
-            # Pre before post -> LTP (strengthen)
             dw = STDP_A_PLUS * math.exp(-dt / STDP_TAU_PLUS)
             self.weight = min(STDP_W_MAX, self.weight + dw)
-        elif dt < 0 and abs(dt) < STDP_TAU_MINUS * 3:
-            # Post before pre -> LTD (weaken)
+        elif dt < 0 and -dt < STDP_TAU_MINUS * 3:
             dw = STDP_A_MINUS * math.exp(dt / STDP_TAU_MINUS)
             self.weight = max(STDP_W_MIN, self.weight - dw)
 
 
 class Neuron:
+    __slots__ = ('x', 'y', 'layer', 'inhibitory', 'potential', 'spiking',
+                 'spike_time', 'refractory', 'outgoing', 'incoming_buffer',
+                 'radius', 'spike_history')
+
     def __init__(self, x, y, layer, inhibitory=False):
         self.x = x
         self.y = y
         self.layer = layer
+        self.inhibitory = inhibitory
         self.potential = 0.0
         self.spiking = False
         self.spike_time = -999
         self.refractory = 0
-        self.outgoing = []   # list of Synapse objects
+        self.outgoing = []
+        self.incoming_buffer = []
         self.radius = random.uniform(3, 6)
-        self.inhibitory = inhibitory
-        self.incoming_buffer = []  # buffered incoming spikes
         self.spike_history = []
 
     def update(self, frame):
-        # Process incoming spikes
-        still_pending = []
+        pending = []
         for w, arrival in self.incoming_buffer:
             if frame >= arrival:
                 if self.refractory <= 0:
                     self.potential += w
             else:
-                still_pending.append((w, arrival))
-        self.incoming_buffer = still_pending
+                pending.append((w, arrival))
+        self.incoming_buffer = pending
 
         if self.refractory > 0:
             self.refractory -= 1
@@ -79,47 +78,47 @@ class Neuron:
             self.spiking = False
             return False
 
-        # Spontaneous activity
         if random.random() < 0.015:
-            self.potential += random.uniform(0.3, 0.8)
+            self.potential += random.uniform(0.2, 0.6)
 
-        # Decay
         self.potential *= 0.98
 
-        # Spike?
         if self.potential >= 1.0:
             self.spiking = True
             self.spike_time = frame
             self.refractory = random.randint(12, 25)
             self.spike_history.append(frame)
-            if len(self.spike_history) > 100:
+            if len(self.spike_history) > 80:
                 self.spike_history.pop(0)
 
-            # Send spikes via synapses
             for syn in self.outgoing:
                 w = syn.weight * (-0.5 if self.inhibitory else 1.0)
                 syn.target.incoming_buffer.append((w, frame + syn.delay))
-                # Apply STDP on this synapse
-                syn.apply_stdp(frame)
+                syn.apply_stdp()
             return True
-        else:
-            self.spiking = False
-            return False
+
+        self.spiking = False
+        return False
 
 
 class SpikePulse:
-    def __init__(self, sx, sy, tx, ty, start, duration, inhibitory):
+    __slots__ = ('sx', 'sy', 'tx', 'ty', 'start', 'duration', 'inhibitory', 'active')
+
+    def __init__(self):
+        self.active = False
+
+    def init(self, sx, sy, tx, ty, start, duration, inhibitory):
         self.sx, self.sy = sx, sy
         self.tx, self.ty = tx, ty
         self.start = start
         self.duration = duration
         self.inhibitory = inhibitory
-        self.alive = True
+        self.active = True
 
     def progress(self, frame):
         t = (frame - self.start) / self.duration
         if t > 1:
-            self.alive = False
+            self.active = False
             return None
         x = self.sx + (self.tx - self.sx) * t
         y = self.sy + (self.ty - self.sy) * t
@@ -127,346 +126,268 @@ class SpikePulse:
         return x, y, alpha
 
 
-class NeuralScreensaver:
-    def __init__(self, root, width, height):
-        self.root = root
-        self.W = width
-        self.H = height
-        self.canvas = tk.Canvas(root, width=width, height=height, bg='black',
-                                highlightthickness=0, cursor='none')
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+def run():
+    pygame.init()
 
-        self.frame = 0
-        self.total_spikes = 0
-        self.spike_window = []
-        self.pulses = []
-        self.all_synapses = []
+    info = pygame.display.Info()
+    W, H = info.current_w, info.current_h
+    screen = pygame.display.set_mode((W, H), pygame.FULLSCREEN | pygame.NOFRAME)
+    pygame.display.set_caption('Spiking Neural Network')
+    pygame.mouse.set_visible(False)
+    clock = pygame.time.Clock()
 
-        # Create neurons
-        self.neurons = []
-        self.layers = 5
-        neurons_per_layer = 12
-        margin = 60
+    # Create a surface for drawing with alpha
+    surf = pygame.Surface((W, H), pygame.SRCALPHA)
 
-        for l in range(self.layers):
-            n_in_layer = neurons_per_layer + (2 if l == self.layers // 2 else 0)
-            for n in range(n_in_layer):
-                lx = margin + (self.W - margin * 2) * (l / (self.layers - 1))
-                ly = margin + (self.H - margin * 2) * ((n + 0.5) / n_in_layer)
-                jx = lx + random.uniform(-60, 60)
-                jy = ly + random.uniform(-40, 40)
-                inhib = random.random() < 0.18
-                self.neurons.append(Neuron(jx, jy, l, inhib))
+    # Font
+    try:
+        font = pygame.font.Font('/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf', 11)
+        font_small = pygame.font.Font('/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf', 9)
+        font_title = pygame.font.Font('/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf', 13)
+    except:
+        font = pygame.font.SysFont('monospace', 11)
+        font_small = pygame.font.SysFont('monospace', 9)
+        font_title = pygame.font.SysFont('monospace', 13, bold=True)
 
-        # Create connections with Synapse objects
-        for n1 in self.neurons:
-            for n2 in self.neurons:
-                if n1 is n2:
-                    continue
-                dx = n2.x - n1.x
-                dy = n2.y - n1.y
-                dist = math.sqrt(dx*dx + dy*dy)
+    # Create neurons
+    neurons = []
+    layers = 5
+    neurons_per_layer = 12
+    margin = 60
+    for l in range(layers):
+        n_in_layer = neurons_per_layer + (2 if l == layers // 2 else 0)
+        for n in range(n_in_layer):
+            lx = margin + (W - margin * 2) * (l / (layers - 1))
+            ly = margin + (H - margin * 2) * ((n + 0.5) / n_in_layer)
+            jx = lx + random.uniform(-70, 70)
+            jy = ly + random.uniform(-50, 50)
+            inhib = random.random() < 0.18
+            neurons.append(Neuron(jx, jy, l, inhib))
 
-                prob = 0.10
-                if n2.layer > n1.layer:
-                    prob *= 2.5
-                elif n2.layer == n1.layer:
-                    prob *= 1.5
-                else:
-                    prob *= 0.5
-                prob *= max(0, 1 - dist / (self.W * 0.65))
-
-                if random.random() < prob:
-                    weight = random.uniform(0.25, 0.6)
-                    delay = int(dist * 0.06 + random.uniform(3, 15))
-                    syn = Synapse(n1, n2, weight, delay)
-                    n1.outgoing.append(syn)
-                    self.all_synapses.append(syn)
-
-        # Draw connection lines (will be updated with weight-based widths)
-        for syn in self.all_synapses:
-            color = '#0a0500' if syn.source.inhibitory else '#001a08'
-            w = max(0.5, syn.weight * 2.5)
-            cid = self.canvas.create_line(
-                syn.source.x, syn.source.y, syn.target.x, syn.target.y,
-                fill=color, width=w, smooth=True)
-            syn.canvas_id = cid
-
-        # Neuron canvas items
-        self.neuron_ovals = []
-        self.neuron_glows = []
-        for n in self.neurons:
-            glow = self.canvas.create_oval(
-                n.x - n.radius*3, n.y - n.radius*3,
-                n.x + n.radius*3, n.y + n.radius*3,
-                fill='', outline='', width=0)
-            oval = self.canvas.create_oval(
-                n.x - n.radius, n.y - n.radius,
-                n.x + n.radius, n.y + n.radius,
-                fill='#002200', outline='#004400', width=1)
-            self.neuron_glows.append(glow)
-            self.neuron_ovals.append(oval)
-
-        # Pulse items pool
-        self.pulse_items = []
-        for _ in range(80):
-            item = self.canvas.create_oval(0, 0, 0, 0, fill='', outline='', state='hidden')
-            self.pulse_items.append(item)
-
-        # HUD text
-        self.hud_title = self.canvas.create_text(
-            25, 18, text='[ SPIKING NEURAL NETWORK + STDP ]', fill='#1a7a3a',
-            font=('Courier', 11, 'bold'), anchor='w')
-        self.hud_clock = self.canvas.create_text(
-            self.W - 25, 18, text='', fill='#1a7a3a',
-            font=('Courier', 10), anchor='e')
-        self.hud_stats = self.canvas.create_text(
-            25, self.H - 100, text='', fill='#156630',
-            font=('Courier', 9), anchor='w')
-        self.hud_raster_label = self.canvas.create_text(
-            self.W - 230, self.H - 95, text='SPIKE RASTER',
-            fill='#1a7a3a', font=('Courier', 8), anchor='w')
-
-        # Raster plot area
-        self.raster_bg = self.canvas.create_rectangle(
-            self.W - 235, self.H - 85, self.W - 25, self.H - 25,
-            fill='#000800', outline='#003300', width=1)
-        self.raster_items = []
-        for _ in range(200):
-            r = self.canvas.create_line(0, 0, 0, 0, fill='#00ff64', width=1, state='hidden')
-            self.raster_items.append(r)
-
-        # STDP weight distribution label
-        self.hud_stdp_label = self.canvas.create_text(
-            25, 30, text='', fill='#1a7a3a',
-            font=('Courier', 8), anchor='w')
-
-        # Initial stimulation
-        for _ in range(6):
-            n = random.choice(self.neurons)
-            n.potential = 1.2
-
-        # Bind escape
-        self.root.bind('<Escape>', lambda e: self.root.destroy())
-        self.root.bind('<Key>', lambda e: self.root.destroy())
-        self.root.bind('<Button>', lambda e: self.root.destroy())
-        self.root.bind('<Motion>', self._on_motion)
-        self.last_mouse = None
-
-        self.animate()
-
-    def _on_motion(self, event):
-        if self.last_mouse is None:
-            self.last_mouse = (event.x, event.y)
-            return
-        dx = abs(event.x - self.last_mouse[0])
-        dy = abs(event.y - self.last_mouse[1])
-        if dx + dy > 20:
-            self.root.destroy()
-
-    def _update_synapse_visuals(self):
-        """Update connection line widths and colors based on current weights."""
-        for syn in self.all_synapses:
-            if syn.canvas_id is None:
+    # Create synapses
+    all_synapses = []
+    for n1 in neurons:
+        for n2 in neurons:
+            if n1 is n2:
                 continue
-            # Width proportional to weight: thin (weak) to thick (strong)
-            w = max(0.3, syn.weight * 2.5)
-            # Color brightness scales with weight
-            norm_w = min(1.0, syn.weight / STDP_W_MAX)
-            if syn.source.inhibitory:
-                r = min(255, int(10 + norm_w * 60))
-                g = min(255, int(5 + norm_w * 15))
-                color = f'#{r:02x}{g:02x}00'
-            else:
-                g = min(255, int(8 + norm_w * 70))
-                b = min(255, int(4 + norm_w * 30))
-                color = f'#00{g:02x}{b:02x}'
-            self.canvas.itemconfig(syn.canvas_id, width=w, fill=color)
+            dx = n2.x - n1.x
+            dy = n2.y - n1.y
+            d = math.sqrt(dx*dx + dy*dy)
+            prob = 0.10
+            if n2.layer > n1.layer: prob *= 2.5
+            elif n2.layer == n1.layer: prob *= 1.5
+            else: prob *= 0.5
+            prob *= max(0, 1 - d / (W * 0.65))
+            if random.random() < prob:
+                weight = random.uniform(0.25, 0.6)
+                delay = max(3, int(d * 0.06 + random.uniform(3, 15)))
+                syn = Synapse(n1, n2, weight, delay)
+                n1.outgoing.append(syn)
+                all_synapses.append(syn)
 
-    def animate(self):
-        self.frame += 1
+    # Pulse pool
+    pulse_pool = [SpikePulse() for _ in range(60)]
+
+    def get_pulse():
+        for p in pulse_pool:
+            if not p.active:
+                return p
+        return None
+
+    # Initial stimulation
+    for _ in range(6):
+        random.choice(neurons).potential = 1.2
+
+    # Colors
+    EXC_COLOR = (0, 255, 100)
+    INH_COLOR = (255, 70, 50)
+    EXC_DIM = (0, 60, 25)
+    INH_DIM = (60, 15, 10)
+
+    frame = 0
+    total_spikes = 0
+    spike_window = []
+    last_mouse_pos = None
+    mouse_moved_total = 0
+
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                running = False
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                running = False
+            elif event.type == pygame.MOUSEMOTION:
+                if last_mouse_pos is None:
+                    last_mouse_pos = event.pos
+                else:
+                    dx = abs(event.pos[0] - last_mouse_pos[0])
+                    dy = abs(event.pos[1] - last_mouse_pos[1])
+                    mouse_moved_total += dx + dy
+                    if mouse_moved_total > 50:
+                        running = False
+
+        frame += 1
+
+        # Fade: fill with semi-transparent black
+        screen.fill((0, 0, 0))
+        surf.fill((0, 0, 0, 0))
+
+        # Draw synapses
+        for syn in all_synapses:
+            norm_w = min(1.0, syn.weight / STDP_W_MAX)
+            lw = max(1, int(norm_w * 3))
+            alpha = int(15 + norm_w * 35)
+            if syn.source.inhibitory:
+                color = (min(255, int(15 + norm_w * 50)), int(5 + norm_w * 10), 0, alpha)
+            else:
+                color = (0, min(255, int(12 + norm_w * 55)), min(255, int(6 + norm_w * 25)), alpha)
+            pygame.draw.line(surf, color,
+                             (int(syn.source.x), int(syn.source.y)),
+                             (int(syn.target.x), int(syn.target.y)), lw)
 
         # Update neurons
-        new_pulses = []
-        spikes_this_frame = 0
-        for i, n in enumerate(self.neurons):
-            fired = n.update(self.frame)
+        for n in neurons:
+            fired = n.update(frame)
             if fired:
-                spikes_this_frame += 1
-                self.total_spikes += 1
-                self.spike_window.append(self.frame)
+                total_spikes += 1
+                spike_window.append(frame)
+                for syn in all_synapses:
+                    if syn.target is n:
+                        syn.apply_stdp()
+                # Spawn pulses
+                for syn in n.outgoing[:2]:
+                    p = get_pulse()
+                    if p:
+                        dx = syn.target.x - n.x
+                        dy = syn.target.y - n.y
+                        d = math.sqrt(dx*dx + dy*dy)
+                        dur = max(8, int(d * 0.12))
+                        p.init(n.x, n.y, syn.target.x, syn.target.y, frame, dur, n.inhibitory)
 
-                # Also apply STDP on synapses where this neuron is the target
-                # (post-synaptic neuron just fired, check pre timings)
-                for syn in self.all_synapses:
-                    if syn.target is n and syn.source is not n:
-                        syn.apply_stdp(self.frame)
+            # Draw neuron
+            age = frame - n.spike_time
+            flash = max(0, 1 - age / 12) if age < 12 else 0
+            col = INH_COLOR if n.inhibitory else EXC_COLOR
+            dim_col = INH_DIM if n.inhibitory else EXC_DIM
 
-                # Create travel pulses (limit for performance)
-                for syn in n.outgoing[:3]:
-                    dx = syn.target.x - n.x
-                    dy = syn.target.y - n.y
-                    dist = math.sqrt(dx*dx + dy*dy)
-                    dur = max(10, int(dist * 0.12))
-                    new_pulses.append(SpikePulse(n.x, n.y, syn.target.x, syn.target.y,
-                                                 self.frame, dur, n.inhibitory))
+            # Glow
+            if flash > 0.1:
+                glow_r = int(n.radius * 5 * flash)
+                glow_alpha = int(flash * 80)
+                glow_surf = pygame.Surface((glow_r*2, glow_r*2), pygame.SRCALPHA)
+                pygame.draw.circle(glow_surf, (*col, glow_alpha), (glow_r, glow_r), glow_r)
+                surf.blit(glow_surf, (int(n.x - glow_r), int(n.y - glow_r)))
 
-            # Update visuals
-            age = self.frame - n.spike_time
-            if age < 15:
-                flash = max(0, 1 - age / 15)
-                if n.inhibitory:
-                    g = min(255, int(40 + flash * 200))
-                    rb = min(255, int(20 + flash * 30))
-                    fill = f'#{g:02x}{rb:02x}{rb:02x}'
-                    ob = min(255, int(50 + flash * 100))
-                    outline = f'#ff{ob:02x}{ob:02x}'
-                    gv = min(255, int(40 + flash * 60))
-                    glow_fill = f'#{gv:02x}0000'
-                else:
-                    g = min(255, int(80 + flash * 175))
-                    b = min(255, int(30 + flash * 50))
-                    fill = f'#00{g:02x}{b:02x}'
-                    og = min(255, int(100 + flash * 155))
-                    ob = min(255, int(60 + flash * 60))
-                    outline = f'#00{og:02x}{ob:02x}'
-                    gv = min(255, int(20 + flash * 40))
-                    glow_fill = f'#00{gv:02x}00'
-                r = n.radius + flash * 3
-                self.canvas.coords(self.neuron_ovals[i],
-                    n.x - r, n.y - r, n.x + r, n.y + r)
-                self.canvas.itemconfig(self.neuron_ovals[i], fill=fill, outline=outline)
-                gr = n.radius * 4 * flash
-                self.canvas.coords(self.neuron_glows[i],
-                    n.x - gr, n.y - gr, n.x + gr, n.y + gr)
-                self.canvas.itemconfig(self.neuron_glows[i], fill=glow_fill, outline='')
+            # Soma
+            r = int(n.radius + flash * 3)
+            alpha_soma = int(100 + flash * 155)
+            pygame.draw.circle(surf, (*col, alpha_soma), (int(n.x), int(n.y)), r)
+
+            # Outline
+            if flash > 0:
+                pygame.draw.circle(surf, (*col, int(flash * 200)),
+                                   (int(n.x), int(n.y)), r + 1, 1)
             else:
-                # Resting state with potential indicator
-                p = min(1.0, max(0.0, n.potential))
-                if n.inhibitory:
-                    g = min(255, int(30 + p * 40))
-                    fill = f'#{g:02x}1111'
-                    outline = '#331111'
-                else:
-                    g = min(255, int(20 + p * 60))
-                    b = min(255, int(10 + p * 20))
-                    fill = f'#00{g:02x}{b:02x}'
-                    outline = '#003311'
-                self.canvas.coords(self.neuron_ovals[i],
-                    n.x - n.radius, n.y - n.radius,
-                    n.x + n.radius, n.y + n.radius)
-                self.canvas.itemconfig(self.neuron_ovals[i], fill=fill, outline=outline)
-                self.canvas.itemconfig(self.neuron_glows[i], fill='', outline='')
+                p = min(1.0, max(0, n.potential))
+                dim_a = int(50 + p * 60)
+                pygame.draw.circle(surf, (*dim_col, dim_a), (int(n.x), int(n.y)), int(n.radius))
 
-        # Update pulses
-        self.pulses = [p for p in self.pulses if p.alive]
-        self.pulses.extend(new_pulses)
-        if len(self.pulses) > 80:
-            self.pulses = self.pulses[-80:]
+        # Draw pulses
+        for p in pulse_pool:
+            if not p.active:
+                continue
+            result = p.progress(frame)
+            if not result:
+                continue
+            x, y, alpha = result
+            col = INH_COLOR if p.inhibitory else EXC_COLOR
+            pa = int(alpha * 160)
+            pygame.draw.circle(surf, (*col, max(0, pa // 3)), (int(x), int(y)), 5)
+            pygame.draw.circle(surf, (*col, max(0, pa)), (int(x), int(y)), 2)
 
-        for idx, item in enumerate(self.pulse_items):
-            if idx < len(self.pulses):
-                p = self.pulses[idx]
-                result = p.progress(self.frame)
-                if result:
-                    x, y, alpha = result
-                    sz = 2 + alpha * 3
-                    self.canvas.coords(item, x-sz, y-sz, x+sz, y+sz)
-                    if alpha > 0.3:
-                        color = '#ff6644' if p.inhibitory else '#44ff88'
-                    else:
-                        color = '#662211' if p.inhibitory else '#115522'
-                    self.canvas.itemconfig(item, fill=color, outline='', state='normal')
-                else:
-                    self.canvas.itemconfig(item, state='hidden')
-            else:
-                self.canvas.itemconfig(item, state='hidden')
+        # HUD
+        if frame % 10 == 0:
+            spike_window = [t for t in spike_window if frame - t < 120]
 
-        # Update synapse visuals every 15 frames (performance)
-        if self.frame % 15 == 0:
-            self._update_synapse_visuals()
+        rate = len(spike_window) / 2.0
+        weights = [s.weight for s in all_synapses]
+        avg_w = sum(weights) / len(weights) if weights else 0
+        max_w = max(weights) if weights else 0
+        min_w = min(weights) if weights else 0
+        strong = sum(1 for w in weights if w > 0.8)
+        weak = sum(1 for w in weights if w < 0.15)
 
-        # Update HUD every 10 frames
-        if self.frame % 10 == 0:
-            clock = time.strftime('%H:%M:%S')
-            self.canvas.itemconfig(self.hud_clock, text=clock)
+        # Title
+        title_surf = font_title.render('[ SPIKING NEURAL NETWORK + STDP ]', True, (0, 180, 70))
+        title_surf.set_alpha(120)
+        surf.blit(title_surf, (25, 12))
 
-            self.spike_window = [t for t in self.spike_window if self.frame - t < 120]
-            rate = len(self.spike_window) / 2.0
-            n_synapses = len(self.all_synapses)
+        # Clock
+        clock_text = time.strftime('%H:%M:%S')
+        clock_surf = font.render(clock_text, True, (0, 180, 70))
+        clock_surf.set_alpha(100)
+        surf.blit(clock_surf, (W - 100, 12))
 
-            # Weight statistics
-            weights = [s.weight for s in self.all_synapses]
-            avg_w = sum(weights) / len(weights) if weights else 0
-            max_w = max(weights) if weights else 0
-            min_w = min(weights) if weights else 0
-            strong = sum(1 for w in weights if w > 0.8)
-            weak = sum(1 for w in weights if w < 0.15)
+        # Stats
+        stats_lines = [
+            f"NEURONS: {len(neurons)}",
+            f"SYNAPSES: {len(all_synapses)}",
+            f"SPIKE RATE: {rate:.1f} Hz",
+            f"TOTAL SPIKES: {total_spikes}",
+            f"STDP AVG W: {avg_w:.3f}",
+            f"RANGE: [{min_w:.2f} - {max_w:.2f}]",
+            f"STRONG: {strong}  WEAK: {weak}",
+        ]
+        for i, line in enumerate(stats_lines):
+            s = font_small.render(line, True, (0, 150, 60))
+            s.set_alpha(90)
+            surf.blit(s, (25, H - 140 + i * 16))
 
-            stats = (f"NEURONS: {len(self.neurons)}\n"
-                     f"SYNAPSES: {n_synapses}\n"
-                     f"SPIKE RATE: {rate:.1f} Hz\n"
-                     f"TOTAL SPIKES: {self.total_spikes}\n"
-                     f"ACTIVE PULSES: {len(self.pulses)}\n"
-                     f"STDP AVG W: {avg_w:.3f}\n"
-                     f"STDP RANGE: [{min_w:.2f} - {max_w:.2f}]\n"
-                     f"STRONG(>0.8): {strong}  WEAK(<0.15): {weak}")
-            self.canvas.itemconfig(self.hud_stats, text=stats)
+        # Raster plot
+        raster_x, raster_y = W - 230, H - 80
+        raster_w, raster_h = 200, 55
+        pygame.draw.rect(surf, (0, 15, 0, 120),
+                         (raster_x - 2, raster_y - 15, raster_w + 4, raster_h + 18))
+        pygame.draw.rect(surf, (0, 80, 30, 80),
+                         (raster_x - 2, raster_y - 15, raster_w + 4, raster_h + 18), 1)
+        lbl = font_small.render('SPIKE RASTER', True, (0, 150, 60))
+        lbl.set_alpha(100)
+        surf.blit(lbl, (raster_x, raster_y - 13))
 
-        # Update raster plot every 5 frames
-        if self.frame % 5 == 0:
-            ri = 0
-            rw = 200
-            rh = 55
-            rx = self.W - 230
-            ry = self.H - 82
-            for ni, n in enumerate(self.neurons):
-                ny = ry + (ni / len(self.neurons)) * rh
-                for st in n.spike_history[-5:]:
-                    age = self.frame - st
-                    if age < rw and ri < len(self.raster_items):
-                        sx = rx + rw - age
-                        color = '#ff4444' if n.inhibitory else '#00ff64'
-                        self.canvas.coords(self.raster_items[ri], sx, ny, sx+1.5, ny+1)
-                        self.canvas.itemconfig(self.raster_items[ri],
-                            fill=color, state='normal')
-                        ri += 1
-            for j in range(ri, len(self.raster_items)):
-                self.canvas.itemconfig(self.raster_items[j], state='hidden')
+        for ni, n in enumerate(neurons):
+            ny = raster_y + (ni / len(neurons)) * raster_h
+            for st in n.spike_history[-4:]:
+                age = frame - st
+                if age < raster_w:
+                    sx = raster_x + raster_w - age
+                    col = (255, 70, 50) if n.inhibitory else (0, 255, 100)
+                    alpha = max(30, 255 - int(age * 2))
+                    pygame.draw.line(surf, (*col, alpha),
+                                     (int(sx), int(ny)), (int(sx + 1), int(ny + 1)), 1)
 
-        # Periodic stimulation - frequent bursts to keep network alive
-        if self.frame % 25 == 0:
-            layer = random.randint(0, self.layers - 1)
-            layer_neurons = [n for n in self.neurons if n.layer == layer]
+        # Blit alpha surface
+        screen.blit(surf, (0, 0))
+
+        # Periodic stimulation
+        if frame % 25 == 0:
+            layer = random.randint(0, layers - 1)
+            layer_neurons = [n for n in neurons if n.layer == layer]
             for _ in range(random.randint(2, 5)):
-                n = random.choice(layer_neurons)
-                n.potential += random.uniform(0.6, 1.1)
+                random.choice(layer_neurons).potential += random.uniform(0.6, 1.1)
 
-        # Random global wave every ~3 seconds
-        if self.frame % 90 == 0:
-            count = random.randint(4, 8)
-            for _ in range(count):
-                n = random.choice(self.neurons)
-                n.potential = 1.0 + random.uniform(0, 0.3)
+        # Global wave
+        if frame % 90 == 0:
+            for _ in range(random.randint(4, 8)):
+                random.choice(neurons).potential = 1.0 + random.uniform(0, 0.3)
 
-        self.root.after(33, self.animate)  # ~30fps for Atom CPU
+        pygame.display.flip()
+        clock.tick(FPS)
 
-
-def main():
-    root = tk.Tk()
-    root.title('Spiking Neural Network')
-    root.configure(bg='black')
-
-    root.attributes('-fullscreen', True)
-    root.overrideredirect(True)
-
-    root.update_idletasks()
-    width = root.winfo_screenwidth()
-    height = root.winfo_screenheight()
-
-    NeuralScreensaver(root, width, height)
-    root.mainloop()
+    pygame.quit()
 
 
 if __name__ == '__main__':
-    main()
+    run()
