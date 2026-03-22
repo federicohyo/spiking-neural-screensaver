@@ -1,12 +1,27 @@
 #!/usr/bin/env python3
 """Spiking Neural Network Screensaver with STDP — pygame version."""
 import os
+import subprocess
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
+
+# Handle xscreensaver's -window-id argument
+# xscreensaver passes: program -window-id 0x...
+# We embed pygame into that window via SDL_WINDOWID
+window_id = None
+import sys
+for i, arg in enumerate(sys.argv):
+    if arg == '-window-id' and i + 1 < len(sys.argv):
+        window_id = sys.argv[i + 1]
+        break
+
+if window_id:
+    # Get the xscreensaver window dimensions
+    os.environ['SDL_WINDOWID'] = window_id
+    os.environ['SDL_VIDEO_CENTERED'] = '1'
 
 import pygame
 import math
 import random
-import sys
 import time
 
 random.seed()
@@ -129,9 +144,28 @@ class SpikePulse:
 def run():
     pygame.init()
 
-    info = pygame.display.Info()
-    W, H = info.current_w, info.current_h
-    screen = pygame.display.set_mode((W, H), pygame.FULLSCREEN | pygame.NOFRAME)
+    if window_id:
+        # Embedded in xscreensaver window — get window size via xdotool/xwininfo
+        try:
+            out = subprocess.check_output(
+                ['xdotool', 'getwindowgeometry', '--shell', window_id],
+                stderr=subprocess.DEVNULL).decode()
+            dims = {}
+            for line in out.strip().split('\n'):
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    dims[k] = int(v)
+            W = dims.get('WIDTH', 1024)
+            H = dims.get('HEIGHT', 768)
+        except Exception:
+            W, H = 1024, 768
+        screen = pygame.display.set_mode((W, H))
+    else:
+        # Standalone fullscreen
+        info = pygame.display.Info()
+        W, H = info.current_w, info.current_h
+        screen = pygame.display.set_mode((W, H), pygame.FULLSCREEN | pygame.NOFRAME)
+
     pygame.display.set_caption('Spiking Neural Network')
     pygame.mouse.set_visible(False)
     clock = pygame.time.Clock()
