@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+"""Spiking Neural Network Screensaver with STDP - renders fullscreen."""
+import tkinter as tk
+import math
+import random
+import sys
+import os
+import time
+
+random.seed()
+
+# STDP parameters
+STDP_A_PLUS = 0.02      # LTP amplitude (pre before post)
+STDP_A_MINUS = 0.015    # LTD amplitude (post before pre)
+STDP_TAU_PLUS = 20.0    # LTP time window (frames)
+STDP_TAU_MINUS = 25.0   # LTD time window (frames)
+STDP_W_MIN = 0.05       # Minimum synaptic weight
+STDP_W_MAX = 1.2        # Maximum synaptic weight
+
+
+class Synapse:
+    """A synapse with mutable weight for STDP."""
+    def __init__(self, source, target, weight, delay):
+        self.source = source
+        self.target = target
+        self.weight = weight
+        self.delay = delay
+        self.canvas_id = None  # set after drawing
+
+    def apply_stdp(self, frame):
+        """Apply STDP rule based on pre/post spike timing."""
+        pre_time = self.source.spike_time
+        post_time = self.target.spike_time
+
+        if pre_time < 0 or post_time < 0:
+            return
+
+        dt = post_time - pre_time  # positive = pre before post (LTP)
+
+        if dt > 0 and dt < STDP_TAU_PLUS * 3:
+            # Pre before post -> LTP (strengthen)
+            dw = STDP_A_PLUS * math.exp(-dt / STDP_TAU_PLUS)
+            self.weight = min(STDP_W_MAX, self.weight + dw)
+        elif dt < 0 and abs(dt) < STDP_TAU_MINUS * 3:
+            # Post before pre -> LTD (weaken)
+            dw = STDP_A_MINUS * math.exp(dt / STDP_TAU_MINUS)
+            self.weight = max(STDP_W_MIN, self.weight - dw)
+
+
+class Neuron:
+    def __init__(self, x, y, layer, inhibitory=False):
+        self.x = x
+        self.y = y
+        self.layer = layer
+        self.potential = 0.0
+        self.spiking = False
+        self.spike_time = -999
+        self.refractory = 0
+        self.outgoing = []   # list of Synapse objects
+        self.radius = random.uniform(3, 6)
+        self.inhibitory = inhibitory
+        self.incoming_buffer = []  # buffered incoming spikes
+        self.spike_history = []
+
+    def update(self, frame):
+        # Process incoming spikes
+        still_pending = []
+        for w, arrival in self.incoming_buffer:
+            if frame >= arrival:
+                if self.refractory <= 0:
+                    self.potential += w
+            else:
+                still_pending.append((w, arrival))
+        self.incoming_buffer = still_pending
+
+        if self.refractory > 0:
+            self.refractory -= 1
+            self.potential *= 0.85
+            self.spiking = False
+            return False
+
+        # Spontaneous activity
+        if random.random() < 0.015:
+            self.potential += random.uniform(0.3, 0.8)
+
+        # Decay
+        self.potential *= 0.98
+
+        # Spike?
+        if self.potential >= 1.0:
+            self.spiking = True
+            self.spike_time = frame
+            self.refractory = random.randint(12, 25)
+            self.spike_history.append(frame)
+            if len(self.spike_history) > 100:
+                self.spike_history.pop(0)
+
+            # Send spikes via synapses
+            for syn in self.outgoing:
+                w = syn.weight * (-0.5 if self.inhibitory else 1.0)
+                syn.target.incoming_buffer.append((w, frame + syn.delay))
+                # Apply STDP on this synapse
+                syn.apply_stdp(frame)
+            return True
+        else:
+            self.spiking = False
+            return False
+
+
+class SpikePulse:
+    def __init__(self, sx, sy, tx, ty, start, duration, inhibitory):
+        self.sx, self.sy = sx, sy
+        self.tx, self.ty = tx, ty
+        self.start = start
+        self.duration = duration
+        self.inhibitory = inhibitory
+        self.alive = True
+
+    def progress(self, frame):
+        t = (frame - self.start) / self.duration
+        if t > 1:
+            self.alive = False
+            return None
+        x = self.sx + (self.tx - self.sx) * t
+        y = self.sy + (self.ty - self.sy) * t
+        alpha = math.sin(t * math.pi)
+        return x, y, alpha
+
+
+class NeuralScreensaver:
+    def __init__(self, root, width, height):
+        self.root = root
+        self.W = width
+        self.H = height
+        self.canvas = tk.Canvas(root, width=width, height=height, bg='black',
+                                highlightthickness=0, cursor='none')
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        self.frame = 0
+        self.total_spikes = 0
+        self.spike_window = []
+        self.pulses = []
+        self.all_synapses = []
+
+        # Create neurons
+        self.neurons = []
+        self.layers = 5
+        neurons_per_layer = 12
+        margin = 60
+
+        for l in range(self.layers):
+            n_in_layer = neurons_per_layer + (2 if l == self.layers // 2 else 0)
+            for n in range(n_in_layer):
+                lx = margin + (self.W - margin * 2) * (l / (self.layers - 1))
+                ly = margin + (self.H - margin * 2) * ((n + 0.5) / n_in_layer)
+                jx = lx + random.uniform(-60, 60)
+                jy = ly + random.uniform(-40, 40)
+                inhib = random.random() < 0.18
+                self.neurons.append(Neuron(jx, jy, l, inhib))
+
+        # Create connections with Synapse objects
+        for n1 in self.neurons:
+            for n2 in self.neurons:
+                if n1 is n2:
+                    continue
+                dx = n2.x - n1.x
+                dy = n2.y - n1.y
+                dist = math.sqrt(dx*dx + dy*dy)
+
+                prob = 0.10
+                if n2.layer > n1.layer:
+                    prob *= 2.5
+                elif n2.layer == n1.layer:
+                    prob *= 1.5
+                else:
+                    prob *= 0.5
+                prob *= max(0, 1 - dist / (self.W * 0.65))
+
+                if random.random() < prob:
+                    weight = random.uniform(0.25, 0.6)
+                    delay = int(dist * 0.06 + random.uniform(3, 15))
+                    syn = Synapse(n1, n2, weight, delay)
+                    n1.outgoing.append(syn)
+                    self.all_synapses.append(syn)
+
+        # Draw connection lines (will be updated with weight-based widths)
+        for syn in self.all_synapses:
+            color = '#0a0500' if syn.source.inhibitory else '#001a08'
+            w = max(0.5, syn.weight * 2.5)
+            cid = self.canvas.create_line(
+                syn.source.x, syn.source.y, syn.target.x, syn.target.y,
+                fill=color, width=w, smooth=True)
+            syn.canvas_id = cid
+
+        # Neuron canvas items
+        self.neuron_ovals = []
+        self.neuron_glows = []
+        for n in self.neurons:
+            glow = self.canvas.create_oval(
+                n.x - n.radius*3, n.y - n.radius*3,
+                n.x + n.radius*3, n.y + n.radius*3,
+                fill='', outline='', width=0)
+            oval = self.canvas.create_oval(
+                n.x - n.radius, n.y - n.radius,
+                n.x + n.radius, n.y + n.radius,
+                fill='#002200', outline='#004400', width=1)
+            self.neuron_glows.append(glow)
+            self.neuron_ovals.append(oval)
+
+        # Pulse items pool
+        self.pulse_items = []
+        for _ in range(80):
+            item = self.canvas.create_oval(0, 0, 0, 0, fill='', outline='', state='hidden')
+            self.pulse_items.append(item)
+
+        # HUD text
+        self.hud_title = self.canvas.create_text(
+            25, 18, text='[ SPIKING NEURAL NETWORK + STDP ]', fill='#1a7a3a',
+            font=('Courier', 11, 'bold'), anchor='w')
+        self.hud_clock = self.canvas.create_text(
+            self.W - 25, 18, text='', fill='#1a7a3a',
+            font=('Courier', 10), anchor='e')
+        self.hud_stats = self.canvas.create_text(
+            25, self.H - 100, text='', fill='#156630',
+            font=('Courier', 9), anchor='w')
+        self.hud_raster_label = self.canvas.create_text(
+            self.W - 230, self.H - 95, text='SPIKE RASTER',
+            fill='#1a7a3a', font=('Courier', 8), anchor='w')
+
+        # Raster plot area
+        self.raster_bg = self.canvas.create_rectangle(
+            self.W - 235, self.H - 85, self.W - 25, self.H - 25,
+            fill='#000800', outline='#003300', width=1)
+        self.raster_items = []
+        for _ in range(200):
+            r = self.canvas.create_line(0, 0, 0, 0, fill='#00ff64', width=1, state='hidden')
+            self.raster_items.append(r)
+
+        # STDP weight distribution label
+        self.hud_stdp_label = self.canvas.create_text(
+            25, 30, text='', fill='#1a7a3a',
+            font=('Courier', 8), anchor='w')
+
+        # Initial stimulation
+        for _ in range(6):
+            n = random.choice(self.neurons)
+            n.potential = 1.2
+
+        # Bind escape
+        self.root.bind('<Escape>', lambda e: self.root.destroy())
+        self.root.bind('<Key>', lambda e: self.root.destroy())
+        self.root.bind('<Button>', lambda e: self.root.destroy())
+        self.root.bind('<Motion>', self._on_motion)
+        self.last_mouse = None
+
+        self.animate()
+
+    def _on_motion(self, event):
+        if self.last_mouse is None:
+            self.last_mouse = (event.x, event.y)
+            return
+        dx = abs(event.x - self.last_mouse[0])
+        dy = abs(event.y - self.last_mouse[1])
+        if dx + dy > 20:
+            self.root.destroy()
+
+    def _update_synapse_visuals(self):
+        """Update connection line widths and colors based on current weights."""
+        for syn in self.all_synapses:
+            if syn.canvas_id is None:
+                continue
+            # Width proportional to weight: thin (weak) to thick (strong)
+            w = max(0.3, syn.weight * 2.5)
+            # Color brightness scales with weight
+            norm_w = min(1.0, syn.weight / STDP_W_MAX)
+            if syn.source.inhibitory:
+                r = min(255, int(10 + norm_w * 60))
+                g = min(255, int(5 + norm_w * 15))
+                color = f'#{r:02x}{g:02x}00'
+            else:
+                g = min(255, int(8 + norm_w * 70))
+                b = min(255, int(4 + norm_w * 30))
+                color = f'#00{g:02x}{b:02x}'
+            self.canvas.itemconfig(syn.canvas_id, width=w, fill=color)
+
+    def animate(self):
+        self.frame += 1
+
+        # Update neurons
+        new_pulses = []
+        spikes_this_frame = 0
+        for i, n in enumerate(self.neurons):
+            fired = n.update(self.frame)
+            if fired:
+                spikes_this_frame += 1
+                self.total_spikes += 1
+                self.spike_window.append(self.frame)
+
+                # Also apply STDP on synapses where this neuron is the target
+                # (post-synaptic neuron just fired, check pre timings)
+                for syn in self.all_synapses:
+                    if syn.target is n and syn.source is not n:
+                        syn.apply_stdp(self.frame)
+
+                # Create travel pulses (limit for performance)
+                for syn in n.outgoing[:3]:
+                    dx = syn.target.x - n.x
+                    dy = syn.target.y - n.y
+                    dist = math.sqrt(dx*dx + dy*dy)
+                    dur = max(10, int(dist * 0.12))
+                    new_pulses.append(SpikePulse(n.x, n.y, syn.target.x, syn.target.y,
+                                                 self.frame, dur, n.inhibitory))
+
+            # Update visuals
+            age = self.frame - n.spike_time
+            if age < 15:
+                flash = max(0, 1 - age / 15)
+                if n.inhibitory:
+                    g = min(255, int(40 + flash * 200))
+                    rb = min(255, int(20 + flash * 30))
+                    fill = f'#{g:02x}{rb:02x}{rb:02x}'
+                    ob = min(255, int(50 + flash * 100))
+                    outline = f'#ff{ob:02x}{ob:02x}'
+                    gv = min(255, int(40 + flash * 60))
+                    glow_fill = f'#{gv:02x}0000'
+                else:
+                    g = min(255, int(80 + flash * 175))
+                    b = min(255, int(30 + flash * 50))
+                    fill = f'#00{g:02x}{b:02x}'
+                    og = min(255, int(100 + flash * 155))
+                    ob = min(255, int(60 + flash * 60))
+                    outline = f'#00{og:02x}{ob:02x}'
+                    gv = min(255, int(20 + flash * 40))
+                    glow_fill = f'#00{gv:02x}00'
+                r = n.radius + flash * 3
+                self.canvas.coords(self.neuron_ovals[i],
+                    n.x - r, n.y - r, n.x + r, n.y + r)
+                self.canvas.itemconfig(self.neuron_ovals[i], fill=fill, outline=outline)
+                gr = n.radius * 4 * flash
+                self.canvas.coords(self.neuron_glows[i],
+                    n.x - gr, n.y - gr, n.x + gr, n.y + gr)
+                self.canvas.itemconfig(self.neuron_glows[i], fill=glow_fill, outline='')
+            else:
+                # Resting state with potential indicator
+                p = min(1.0, max(0.0, n.potential))
+                if n.inhibitory:
+                    g = min(255, int(30 + p * 40))
+                    fill = f'#{g:02x}1111'
+                    outline = '#331111'
+                else:
+                    g = min(255, int(20 + p * 60))
+                    b = min(255, int(10 + p * 20))
+                    fill = f'#00{g:02x}{b:02x}'
+                    outline = '#003311'
+                self.canvas.coords(self.neuron_ovals[i],
+                    n.x - n.radius, n.y - n.radius,
+                    n.x + n.radius, n.y + n.radius)
+                self.canvas.itemconfig(self.neuron_ovals[i], fill=fill, outline=outline)
+                self.canvas.itemconfig(self.neuron_glows[i], fill='', outline='')
+
+        # Update pulses
+        self.pulses = [p for p in self.pulses if p.alive]
+        self.pulses.extend(new_pulses)
+        if len(self.pulses) > 80:
+            self.pulses = self.pulses[-80:]
+
+        for idx, item in enumerate(self.pulse_items):
+            if idx < len(self.pulses):
+                p = self.pulses[idx]
+                result = p.progress(self.frame)
+                if result:
+                    x, y, alpha = result
+                    sz = 2 + alpha * 3
+                    self.canvas.coords(item, x-sz, y-sz, x+sz, y+sz)
+                    if alpha > 0.3:
+                        color = '#ff6644' if p.inhibitory else '#44ff88'
+                    else:
+                        color = '#662211' if p.inhibitory else '#115522'
+                    self.canvas.itemconfig(item, fill=color, outline='', state='normal')
+                else:
+                    self.canvas.itemconfig(item, state='hidden')
+            else:
+                self.canvas.itemconfig(item, state='hidden')
+
+        # Update synapse visuals every 15 frames (performance)
+        if self.frame % 15 == 0:
+            self._update_synapse_visuals()
+
+        # Update HUD every 10 frames
+        if self.frame % 10 == 0:
+            clock = time.strftime('%H:%M:%S')
+            self.canvas.itemconfig(self.hud_clock, text=clock)
+
+            self.spike_window = [t for t in self.spike_window if self.frame - t < 120]
+            rate = len(self.spike_window) / 2.0
+            n_synapses = len(self.all_synapses)
+
+            # Weight statistics
+            weights = [s.weight for s in self.all_synapses]
+            avg_w = sum(weights) / len(weights) if weights else 0
+            max_w = max(weights) if weights else 0
+            min_w = min(weights) if weights else 0
+            strong = sum(1 for w in weights if w > 0.8)
+            weak = sum(1 for w in weights if w < 0.15)
+
+            stats = (f"NEURONS: {len(self.neurons)}\n"
+                     f"SYNAPSES: {n_synapses}\n"
+                     f"SPIKE RATE: {rate:.1f} Hz\n"
+                     f"TOTAL SPIKES: {self.total_spikes}\n"
+                     f"ACTIVE PULSES: {len(self.pulses)}\n"
+                     f"STDP AVG W: {avg_w:.3f}\n"
+                     f"STDP RANGE: [{min_w:.2f} - {max_w:.2f}]\n"
+                     f"STRONG(>0.8): {strong}  WEAK(<0.15): {weak}")
+            self.canvas.itemconfig(self.hud_stats, text=stats)
+
+        # Update raster plot every 5 frames
+        if self.frame % 5 == 0:
+            ri = 0
+            rw = 200
+            rh = 55
+            rx = self.W - 230
+            ry = self.H - 82
+            for ni, n in enumerate(self.neurons):
+                ny = ry + (ni / len(self.neurons)) * rh
+                for st in n.spike_history[-5:]:
+                    age = self.frame - st
+                    if age < rw and ri < len(self.raster_items):
+                        sx = rx + rw - age
+                        color = '#ff4444' if n.inhibitory else '#00ff64'
+                        self.canvas.coords(self.raster_items[ri], sx, ny, sx+1.5, ny+1)
+                        self.canvas.itemconfig(self.raster_items[ri],
+                            fill=color, state='normal')
+                        ri += 1
+            for j in range(ri, len(self.raster_items)):
+                self.canvas.itemconfig(self.raster_items[j], state='hidden')
+
+        # Periodic stimulation - frequent bursts to keep network alive
+        if self.frame % 25 == 0:
+            layer = random.randint(0, self.layers - 1)
+            layer_neurons = [n for n in self.neurons if n.layer == layer]
+            for _ in range(random.randint(2, 5)):
+                n = random.choice(layer_neurons)
+                n.potential += random.uniform(0.6, 1.1)
+
+        # Random global wave every ~3 seconds
+        if self.frame % 90 == 0:
+            count = random.randint(4, 8)
+            for _ in range(count):
+                n = random.choice(self.neurons)
+                n.potential = 1.0 + random.uniform(0, 0.3)
+
+        self.root.after(33, self.animate)  # ~30fps for Atom CPU
+
+
+def main():
+    root = tk.Tk()
+    root.title('Spiking Neural Network')
+    root.configure(bg='black')
+
+    root.attributes('-fullscreen', True)
+    root.overrideredirect(True)
+
+    root.update_idletasks()
+    width = root.winfo_screenwidth()
+    height = root.winfo_screenheight()
+
+    NeuralScreensaver(root, width, height)
+    root.mainloop()
+
+
+if __name__ == '__main__':
+    main()
